@@ -1,274 +1,1487 @@
+import math
 from pathlib import Path
+
 import pandas as pd
 import pypsa
 
 
-# -----------------------------------------------------------------------------
-# 1. Build PyPSA network from config and processed input data
-# -----------------------------------------------------------------------------
-# cfg contains the scenario settings loaded from YAML.
-# data_dir points to the scenario-specific folder with processed CSV inputs.
+# =============================================================================
+# Build PyPSA network from scenario configuration and processed inputs
+# =============================================================================
 def build_test_network(cfg, data_dir):
-    # Convert data_dir to a Path object for safe path handling.
+    """
+    Build the off-grid renewable hydrogen network.
+
+    Current development stage:
+        - Solar PV
+        - Onshore wind
+        - Electrolyzer
+        - Electricity bus
+        - Hydrogen bus
+
+    Not implemented at this stage:
+        - Annual hydrogen production target constraint
+        - Battery storage
+        - Bitcoin mining
+        - Hydrogen storage
+
+    The network is intentionally built in stages so that each subsystem can
+    be validated independently.
+    """
+
     data_dir = Path(data_dir)
 
-    # Check that the required processed input files exist.
-    required_files = [
-        data_dir / "kz_electricity_demand.csv",
-        data_dir / "kz_hydrogen_demand.csv",
-        data_dir / "kz_solar_cf.csv",
-        data_dir / "kz_wind_cf.csv",
-        data_dir / f"{cfg['costs']['active_dataset']}.csv",
-    ]
-    missing = [p for p in required_files if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            "Missing processed input files:\n" + "\n".join(str(p) for p in missing)
+    # -------------------------------------------------------------------------
+    # 1. Read and validate scenario configuration
+    # -------------------------------------------------------------------------
+    system_cfg = cfg["system"]
+    costs_cfg = cfg["costs"]
+
+    renewable_cfg = cfg.get("renewables", {})
+    hydrogen_cfg = cfg.get("hydrogen", {})
+    hydrogen_storage_cfg = cfg.get("hydrogen_storage", {})
+    battery_cfg = cfg.get("battery", {})
+    bitcoin_cfg = cfg.get("bitcoin", {})
+
+    model_type = system_cfg.get("model_type")
+
+    if model_type != "off_grid":
+        raise ValueError(
+            f"This network builder expects system.model_type='off_grid', "
+            f"got {model_type!r}."
         )
 
-    # -------------------------------------------------------------------------
-    # 2. Read scenario settings
-    # -------------------------------------------------------------------------
-    year = int(cfg["system"]["year"])
-    snapshots = int(cfg["system"]["snapshots"])
+    snapshots = int(system_cfg["snapshots"])
+    investment_year = int(system_cfg["investment_year"])
+    weather_year = int(system_cfg["weather_year"])
 
-    # Technology switches and capacities from config.
-    tech_cfg = cfg.get("technology", {})
-    hydrogen_cfg = cfg.get("hydrogen", {})
-    mining_cfg = cfg.get("mining", {})
+    hydrogen_enabled = bool(
+        hydrogen_cfg.get("enabled", False)
+    )
 
-    # -------------------------------------------------------------------------
-    # 3. Load processed time series and cost data
-    # -------------------------------------------------------------------------
-    electricity_demand = pd.read_csv(data_dir / "kz_electricity_demand.csv")
-    hydrogen_demand = pd.read_csv(data_dir / "kz_hydrogen_demand.csv")
-    solar_cf = pd.read_csv(data_dir / "kz_solar_cf.csv")
-    wind_cf = pd.read_csv(data_dir / "kz_wind_cf.csv")
-    costs = pd.read_csv(data_dir / f"{cfg['costs']['active_dataset']}.csv")
+    hydrogen_mode = str(
+        hydrogen_cfg.get(
+            "mode",
+            "production_target",
+        )
+    ).strip().lower()
 
-    # Convert series columns to pandas Series for easier use.
-    electricity_demand = electricity_demand["electricity_mw"]
-    hydrogen_demand = hydrogen_demand["hydrogen_mw"]
-    solar_cf = solar_cf["solar_cf"]
-    wind_cf = wind_cf["wind_cf"]
+    battery_enabled = bool(
+        battery_cfg.get("enabled", False)
+    )
 
-    # -------------------------------------------------------------------------
-    # 4. Build snapshots
-    # -------------------------------------------------------------------------
-    # Use an hourly DatetimeIndex for the modeled period.
-    snapshot_index = pd.date_range(
-        start=f"{year}-01-01 00:00:00",
-        periods=snapshots,
-        freq="h",
+    bitcoin_enabled = bool(
+        bitcoin_cfg.get("enabled", False)
+    )
+
+    hydrogen_storage_enabled = bool(
+        hydrogen_storage_cfg.get("enabled", False)
     )
 
     # -------------------------------------------------------------------------
-    # 5. Create empty PyPSA network
+    # 2. Guard against technologies not implemented in this development stage
+    # -------------------------------------------------------------------------
+
+
+    if hydrogen_storage_enabled:
+        raise NotImplementedError(
+            "Hydrogen storage is enabled in the scenario, but H2 storage "
+            "has not yet been implemented in the redesigned off-grid model."
+        )
+
+    if not hydrogen_enabled:
+        raise ValueError(
+            "The current off-grid reference architecture requires "
+            "hydrogen.enabled=true."
+        )
+
+    supported_hydrogen_modes = {
+        "production_target",
+        "maximize_production",
+        "economic_dispatch",
+    }
+
+    if hydrogen_mode not in supported_hydrogen_modes:
+        raise ValueError(
+            "Unsupported hydrogen.mode. Expected one of "
+            f"{sorted(supported_hydrogen_modes)}, "
+            f"got {hydrogen_mode!r}."
+        )
+
+    # -------------------------------------------------------------------------
+    # 3. Required processed inputs
+    # -------------------------------------------------------------------------
+    active_cost_dataset = costs_cfg["active_dataset"]
+
+    required_files = [
+        data_dir / f"{active_cost_dataset}.csv",
+        data_dir / "kz_solar_cf.csv",
+        data_dir / "kz_wind_cf.csv",
+    ]
+
+    missing = [
+        path
+        for path in required_files
+        if not path.exists()
+    ]
+
+    if missing:
+        raise FileNotFoundError(
+            "Missing processed input files:\n"
+            + "\n".join(str(path) for path in missing)
+        )
+
+    # -------------------------------------------------------------------------
+    # 4. Load processed inputs
+    # -------------------------------------------------------------------------
+    costs = pd.read_csv(
+        data_dir / f"{active_cost_dataset}.csv"
+    )
+
+    solar_cf = pd.read_csv(
+        data_dir / "kz_solar_cf.csv"
+    )["solar_cf"]
+
+    wind_cf = pd.read_csv(
+        data_dir / "kz_wind_cf.csv"
+    )["wind_cf"]
+
+    for name, series in {
+        "solar_cf": solar_cf,
+        "wind_cf": wind_cf,
+    }.items():
+        if len(series) != snapshots:
+            raise ValueError(
+                f"{name} contains {len(series)} rows, "
+                f"but system.snapshots={snapshots}."
+            )
+
+    # -------------------------------------------------------------------------
+    # 5. Build model snapshot calendar
+    # -------------------------------------------------------------------------
+    full_year_index = pd.date_range(
+        start=f"{weather_year}-01-01 00:00:00",
+        end=f"{weather_year}-12-31 23:00:00",
+        freq="h",
+    )
+
+    if len(full_year_index) == 8784 and snapshots == 8760:
+        leap_day = (
+            (full_year_index.month == 2)
+            & (full_year_index.day == 29)
+        )
+        snapshot_index = full_year_index[~leap_day]
+    else:
+        snapshot_index = full_year_index
+
+    if len(snapshot_index) != snapshots:
+        raise ValueError(
+            f"Snapshot calendar contains {len(snapshot_index)} hours, "
+            f"but system.snapshots={snapshots}."
+        )
+
+    # -------------------------------------------------------------------------
+    # 6. Create PyPSA network
     # -------------------------------------------------------------------------
     n = pypsa.Network()
     n.set_snapshots(snapshot_index)
 
     # -------------------------------------------------------------------------
-    # 6. Add buses
+    # 7. Define carriers explicitly
     # -------------------------------------------------------------------------
-    n.add("Bus", "electricity_bus", carrier="AC")
-    n.add("Bus", "hydrogen_bus", carrier="H2")
+    carriers = [
+        "AC",
+        "H2",
+        "solar",
+        "wind",
+        "electrolyzer",
+        "hydrogen_delivery",
+    ]
+
+    if battery_enabled:
+        carriers.append("battery")
+
+    if bitcoin_enabled:
+        carriers.append("bitcoin_mining")
+
+    n.add(
+        "Carrier",
+        carriers,
+    )
 
     # -------------------------------------------------------------------------
-    # 7. Helper function to extract cost values
+    # 8. Add energy buses
     # -------------------------------------------------------------------------
-    # This reads a single parameter value from the processed costs table.
-    def get_cost(technology, parameter, default=None):
+    n.add(
+        "Bus",
+        "electricity_bus",
+        carrier="AC",
+    )
+
+    n.add(
+        "Bus",
+        "hydrogen_bus",
+        carrier="H2",
+    )
+
+    if battery_enabled:
+        n.add(
+            "Bus",
+            "battery_bus",
+            carrier="battery",
+        )
+
+    # -------------------------------------------------------------------------
+    # 9. Cost helper functions
+    # -------------------------------------------------------------------------
+    def get_cost_row(technology, parameter):
         rows = costs[
-            (costs["technology"] == technology) &
-            (costs["parameter"] == parameter)
+            (costs["technology"] == technology)
+            & (costs["parameter"] == parameter)
         ]
+
         if rows.empty:
+            return None
+
+        return rows.iloc[0]
+
+    def get_cost(
+        technology,
+        parameter,
+        default=None,
+    ):
+        row = get_cost_row(
+            technology,
+            parameter,
+        )
+
+        if row is None:
             if default is not None:
-                return default
-            raise KeyError(f"Missing cost entry for {technology} / {parameter}")
-        return float(rows["value"].iloc[0])
+                return float(default)
+
+            raise KeyError(
+                f"Missing cost entry for "
+                f"{technology} / {parameter}"
+            )
+
+        return float(row["value"])
+
+    def get_investment_cost_for_pypsa(technology):
+        """
+        Convert technology-data investment-cost units to the MW/MWh basis
+        required by PyPSA nominal capacities.
+        """
+
+        row = get_cost_row(
+            technology,
+            "investment",
+        )
+
+        if row is None:
+            raise KeyError(
+                f"Missing investment cost for technology "
+                f"'{technology}'."
+            )
+
+        value = float(row["value"])
+        unit = str(row["unit"]).strip()
+
+        if unit in {
+            "EUR/kW",
+            "EUR/kW_e",
+            "EUR/kWh",
+        }:
+            return value * 1000.0
+
+        if unit in {
+            "EUR/MW",
+            "EUR/MW_e",
+            "EUR/MWh",
+        }:
+            return value
+
+        raise ValueError(
+            f"Unsupported investment-cost unit "
+            f"'{unit}' for technology '{technology}'."
+        )
 
     def annuity(rate, lifetime):
         if lifetime <= 0:
-            raise ValueError(f"Lifetime must be positive, got {lifetime}")
+            raise ValueError(
+                f"Lifetime must be positive, got {lifetime}."
+            )
+
         if rate == 0:
             return 1.0 / lifetime
-        return rate / (1.0 - (1.0 + rate) ** (-lifetime))
 
+        return rate / (
+            1.0
+            - (1.0 + rate) ** (-lifetime)
+        )
 
-    def get_annualized_capital_cost(technology, default_discount_rate=0.07):
-        investment = get_cost(technology, "investment")
-        fom_percent = get_cost(technology, "FOM", 0.0)
-        lifetime = get_cost(technology, "lifetime")
-        discount_rate = float(cfg.get("costs", {}).get("discount_rate", default_discount_rate))
+    def get_annualized_capital_cost(
+        technology,
+        default_discount_rate=0.07,
+    ):
+        investment = get_investment_cost_for_pypsa(
+            technology
+        )
 
-        annualized_capex = investment * annuity(discount_rate, lifetime)
-        annualized_fom = annualized_capex * fom_percent / 100.0
+        fom_percent = get_cost(
+            technology,
+            "FOM",
+            0.0,
+        )
 
-        return annualized_capex + annualized_fom
+        lifetime = get_cost(
+            technology,
+            "lifetime",
+        )
+
+        discount_rate = float(
+            costs_cfg.get(
+                "discount_rate",
+                default_discount_rate,
+            )
+        )
+
+        annualized_capex = (
+            investment
+            * annuity(
+                discount_rate,
+                lifetime,
+            )
+        )
+
+        annualized_fom = (
+            investment
+            * fom_percent
+            / 100.0
+        )
+
+        return (
+            annualized_capex
+            + annualized_fom
+        )
+
+    def get_electrolyzer_annualized_capital_cost():
+        """
+        Return the electrolyzer annualized fixed cost in EUR/MW_el/year.
+
+        Backward-compatible behavior:
+        if no electrolyzer-specific economic overrides are configured,
+        use the generic technology-data 'electrolysis' row exactly as
+        before.
+
+        Thesis behavior:
+        CAPEX, FOM and plant lifetime may be supplied explicitly under
+        the hydrogen configuration. These three parameters form one
+        consistent techno-economic parameter set and must therefore be
+        provided together.
+        """
+
+        override_keys = [
+            "electrolyzer_capex_eur_per_kw",
+            "electrolyzer_fom_percent_per_year",
+            "electrolyzer_lifetime_years",
+        ]
+
+        configured = {
+            key: hydrogen_cfg.get(key)
+            for key in override_keys
+        }
+
+        provided = [
+            key
+            for key, value in configured.items()
+            if value is not None
+        ]
+
+        # No thesis-specific override:
+        # preserve the frozen validation implementation.
+        if not provided:
+            return get_annualized_capital_cost(
+                "electrolysis"
+            )
+
+        # Prevent accidental mixing of PEM and generic alkaline
+        # techno-economic assumptions.
+        if len(provided) != len(override_keys):
+            missing = [
+                key
+                for key in override_keys
+                if configured[key] is None
+            ]
+
+            raise ValueError(
+                "Electrolyzer economic overrides must be provided "
+                "as a complete CAPEX/FOM/lifetime parameter set. "
+                f"Missing: {missing}"
+            )
+
+        capex_eur_per_kw = float(
+            configured[
+                "electrolyzer_capex_eur_per_kw"
+            ]
+        )
+
+        fom_percent = float(
+            configured[
+                "electrolyzer_fom_percent_per_year"
+            ]
+        )
+
+        lifetime_years = float(
+            configured[
+                "electrolyzer_lifetime_years"
+            ]
+        )
+
+        if capex_eur_per_kw <= 0.0:
+            raise ValueError(
+                "hydrogen.electrolyzer_capex_eur_per_kw "
+                "must be greater than zero."
+            )
+
+        if fom_percent < 0.0:
+            raise ValueError(
+                "hydrogen.electrolyzer_fom_percent_per_year "
+                "must be non-negative."
+            )
+
+        if lifetime_years <= 0.0:
+            raise ValueError(
+                "hydrogen.electrolyzer_lifetime_years "
+                "must be greater than zero."
+            )
+
+        discount_rate = float(
+            costs_cfg.get(
+                "discount_rate",
+                0.07,
+            )
+        )
+
+        investment_eur_per_mw = (
+            capex_eur_per_kw
+            * 1000.0
+        )
+
+        annualized_capex = (
+            investment_eur_per_mw
+            * annuity(
+                discount_rate,
+                lifetime_years,
+            )
+        )
+
+        annualized_fom = (
+            investment_eur_per_mw
+            * fom_percent
+            / 100.0
+        )
+
+        return (
+            annualized_capex
+            + annualized_fom
+        )
 
     # -------------------------------------------------------------------------
-    # 8. Add generators: solar and wind
+    # 10. Add renewable generators
     # -------------------------------------------------------------------------
-    n.add(
-        "Generator",
+    solar_cfg = renewable_cfg.get(
         "solar",
-        bus="electricity_bus",
-        carrier="solar",
-        p_nom_extendable=True,
-        capital_cost=get_annualized_capital_cost("solar-utility"),
-        marginal_cost=get_cost("solar-utility", "VOM", 0.0),
-        efficiency=1.0,
-        p_max_pu=solar_cf.values,
+        {},
     )
 
-    n.add(
-        "Generator",
+    wind_cfg = renewable_cfg.get(
         "wind",
-        bus="electricity_bus",
-        carrier="wind",
-        p_nom_extendable=True,
-        capital_cost=get_annualized_capital_cost("onwind"),
-        marginal_cost=get_cost("onwind", "VOM", 0.0),
-        efficiency=1.0,
-        p_max_pu=wind_cf.values,
+        {},
     )
 
-    # -------------------------------------------------------------------------
-    # 9. Add electricity demand load
-    # -------------------------------------------------------------------------
-    n.add(
-        "Load",
-        "electricity_demand",
-        bus="electricity_bus",
-        p_set=electricity_demand.values,
-    )
-
-    # -------------------------------------------------------------------------
-    # 10. Add load shedding generator
-    # -------------------------------------------------------------------------
-    # This provides a very expensive fallback to preserve feasibility.
-    n.add(
-        "Generator",
-        "load_shedding",
-        bus="electricity_bus",
-        carrier="load_shedding",
-        p_nom_extendable=True,
-        marginal_cost=float(cfg["demand"].get("load_shedding_cost_eur_per_mwh", 10000.0)),
-    )
-
-    # -------------------------------------------------------------------------
-    # 11. Add hydrogen system if enabled
-    # -------------------------------------------------------------------------
-    hydrogen_enabled = bool(hydrogen_cfg.get("enabled", True))
-    hydrogen_mode = hydrogen_cfg.get("mode", "fixed_demand")
-
-    if hydrogen_enabled:
-        # Add electrolyzer as a link from electricity to hydrogen.
-        n.add(
-            "Link",
-            "electrolyzer",
-            bus0="electricity_bus",
-            bus1="hydrogen_bus",
-            carrier="electrolyzer",
-            p_nom_extendable=True,
-            efficiency=get_cost("electrolysis", "efficiency", 0.7),
-            capital_cost=get_annualized_capital_cost("electrolysis"),
-            marginal_cost=get_cost("electrolysis", "VOM", 0.0),
-        )
-
-        # Add hydrogen storage.
-        n.add(
-            "Store",
-            "hydrogen_storage",
-            bus="hydrogen_bus",
-            carrier="hydrogen_storage",
-            e_nom_extendable=True,
-            capital_cost=get_annualized_capital_cost("hydrogen storage underground"),
-            e_cyclic=True,
-        )
-
-        # Add fixed hydrogen demand if that mode is active.
-        if hydrogen_mode == "fixed_demand":
-            n.add(
-                "Load",
-                "hydrogen_demand",
-                bus="hydrogen_bus",
-                p_set=hydrogen_demand.values,
+    # Endogenous hydrogen production without finite renewable capacity
+    # limits can become unbounded when renewable generation, PEM capacity,
+    # and product output are all extendable. Therefore every enabled and
+    # extendable renewable technology must have a positive capacity limit
+    # in both physical-maximum and merchant-production modes.
+    if hydrogen_mode in {
+        "maximize_production",
+        "economic_dispatch",
+    }:
+        for renewable_name, asset_cfg in (
+            ("solar", solar_cfg),
+            ("wind", wind_cfg),
+        ):
+            renewable_enabled = bool(
+                asset_cfg.get(
+                    "enabled",
+                    True,
+                )
             )
 
-        # Add flexible hydrogen sink if that mode is active.
-        elif hydrogen_mode == "flexible_sink":
-            n.add(
-                "Generator",
-                "hydrogen_sink",
-                bus="hydrogen_bus",
-                carrier="hydrogen_sink",
-                sign=-1.0,
-                p_nom_extendable=False,
-                p_nom=float(cfg["demand"].get("hydrogen_mw", 0.0)),
-                marginal_cost=0.0,
+            renewable_extendable = bool(
+                asset_cfg.get(
+                    "p_nom_extendable",
+                    True,
+                )
             )
 
-        # -------------------------------------------------------------------------
-    # 12. Add bitcoin mining sink if enabled
-    # -------------------------------------------------------------------------
-    # Mining is modeled as an optional electricity consumer.
-    # In PyPSA, this is represented as a Generator with sign = -1.
-    # A negative marginal cost means that consuming electricity yields value
-    # to the optimizer, so the model will dispatch mining when profitable.
-    if bool(mining_cfg.get("enabled", False)):
-        mining_max_mw = float(mining_cfg.get("max_capacity_mw", 0.0))
+            if (
+                renewable_enabled
+                and renewable_extendable
+            ):
+                max_capacity_mw = asset_cfg.get(
+                    "max_capacity_mw"
+                )
 
-        hashprice_eur_per_th_day = float(
-            mining_cfg.get("hashprice_eur_per_th_day", 0.0)
-        )
-        asic_efficiency_j_per_th = float(
-            mining_cfg.get("asic_efficiency_j_per_th", 0.0)
-        )
-        other_opex_eur_per_mwh = float(
-            mining_cfg.get("other_opex_eur_per_mwh", 0.0)
+                if max_capacity_mw is None:
+                    raise ValueError(
+                        f"renewables.{renewable_name}.max_capacity_mw "
+                        "must be defined for "
+                        f"hydrogen.mode={hydrogen_mode!r}."
+                    )
+
+                max_capacity_mw = float(
+                    max_capacity_mw
+                )
+
+                if (
+                    not math.isfinite(max_capacity_mw)
+                    or max_capacity_mw <= 0.0
+                ):
+                    raise ValueError(
+                        f"renewables.{renewable_name}.max_capacity_mw "
+                        "must be finite and greater than zero for "
+                        f"hydrogen.mode={hydrogen_mode!r}."
+                    )
+
+    if bool(solar_cfg.get("enabled", True)):
+        solar_kwargs = {}
+
+        solar_max_capacity = solar_cfg.get(
+            "max_capacity_mw"
         )
 
-        # Convert ASIC efficiency to MW per TH/s:
-        # J/s = W, so J/TH * TH/s = W
-        mw_per_th_per_s = asic_efficiency_j_per_th / 1e6
-
-        # Revenue per MWhe:
-        # 1 MW sustained for 1 hour = 24 / mw_per_th_per_s TH-day
-        if mw_per_th_per_s > 0:
-            th_day_per_mwh = 1/24.0 / mw_per_th_per_s # changed from 24.0 to 1/24.0 
-            mining_revenue_eur_per_mwh = (
-                hashprice_eur_per_th_day * th_day_per_mwh
-                - other_opex_eur_per_mwh
+        if solar_max_capacity is not None:
+            solar_kwargs["p_nom_max"] = float(
+                solar_max_capacity
             )
-        else:
-            mining_revenue_eur_per_mwh = 0.0
-
-        print(f"Mining revenue estimate: {mining_revenue_eur_per_mwh:.2f} EUR/MWh")
 
         n.add(
             "Generator",
-            "bitcoin_mining_sink",
+            "solar",
             bus="electricity_bus",
-            carrier="bitcoin_mining",
-            sign=-1.0,
-            p_nom=mining_max_mw,
-            p_nom_extendable=False,
-            p_min_pu=0.0,
-            p_max_pu=1.0,
-            marginal_cost=-mining_revenue_eur_per_mwh,
+            carrier="solar",
+            p_nom_extendable=bool(
+                solar_cfg.get(
+                    "p_nom_extendable",
+                    True,
+                )
+            ),
+            capital_cost=get_annualized_capital_cost(
+                "solar-utility"
+            ),
+            marginal_cost=get_cost(
+                "solar-utility",
+                "VOM",
+                0.0,
+            ),
+            p_max_pu=solar_cf.values,
+            **solar_kwargs,
+        )
+
+    if bool(wind_cfg.get("enabled", True)):
+        wind_kwargs = {}
+
+        wind_max_capacity = wind_cfg.get(
+            "max_capacity_mw"
+        )
+
+        if wind_max_capacity is not None:
+            wind_kwargs["p_nom_max"] = float(
+                wind_max_capacity
+            )
+
+        n.add(
+            "Generator",
+            "wind",
+            bus="electricity_bus",
+            carrier="wind",
+            p_nom_extendable=bool(
+                wind_cfg.get(
+                    "p_nom_extendable",
+                    True,
+                )
+            ),
+            capital_cost=get_annualized_capital_cost(
+                "onwind"
+            ),
+            marginal_cost=get_cost(
+                "onwind",
+                "VOM",
+                0.0,
+            ),
+            p_max_pu=wind_cf.values,
+            **wind_kwargs,
         )
 
     # -------------------------------------------------------------------------
-    # 13. Print basic network diagnostics
+    # 11. Add electrical battery storage
     # -------------------------------------------------------------------------
-    print("Built network successfully")
-    print(f"Snapshots: {len(n.snapshots)}")
-    print(f"Data directory: {data_dir}")
-    print(f"Hydrogen enabled: {hydrogen_enabled}")
-    print(f"Hydrogen mode: {hydrogen_mode}")
-    print(f"Mining enabled: {bool(mining_cfg.get('enabled', False))}")
+    #
+    # The battery is represented by:
+    #
+    #   electricity_bus
+    #          |
+    #          v
+    #   battery_charger
+    #          |
+    #          v
+    #      battery_bus
+    #          |
+    #     battery_store
+    #          |
+    #          v
+    #   battery_discharger
+    #          |
+    #          v
+    #   electricity_bus
+    #
+    # Power capacity [MW] and energy capacity [MWh] are therefore
+    # independently extendable.
+    #
+    # IMPORTANT:
+    # The charger/discharger power-capacity coupling constraint is NOT
+    # created here because the Linopy capacity variables do not exist until
+    # PyPSA builds the optimization model. That constraint will be added in
+    # run_model.py through extra_functionality.
+    # -------------------------------------------------------------------------
+
+    if battery_enabled:
+        inverter_technology = str(
+            battery_cfg.get(
+                "inverter_technology",
+                "battery inverter",
+            )
+        )
+
+        storage_technology = str(
+            battery_cfg.get(
+                "storage_technology",
+                "battery storage",
+            )
+        )
+
+        battery_p_nom_extendable = bool(
+            battery_cfg.get(
+                "p_nom_extendable",
+                True,
+            )
+        )
+
+        battery_e_nom_extendable = bool(
+            battery_cfg.get(
+                "e_nom_extendable",
+                True,
+            )
+        )
+
+        # At the current development stage S1 is explicitly a capacity-
+        # expansion case. Fixed battery capacities are not yet supported.
+        if not battery_p_nom_extendable:
+            raise ValueError(
+                "The current S1 battery implementation requires "
+                "battery.p_nom_extendable=true."
+            )
+
+        if not battery_e_nom_extendable:
+            raise ValueError(
+                "The current S1 battery implementation requires "
+                "battery.e_nom_extendable=true."
+            )
+
+        inverter_efficiency = get_cost(
+            inverter_technology,
+            "efficiency",
+        )
+
+        if not 0.0 < inverter_efficiency <= 1.0:
+            raise ValueError(
+                "Battery inverter efficiency must be "
+                "greater than 0 and at most 1."
+            )
+
+        # technology-data / PyPSA-Eur convention:
+        # the generic battery-inverter efficiency is split symmetrically
+        # between charging and discharging.
+        battery_charge_efficiency = math.sqrt(
+            inverter_efficiency
+        )
+
+        battery_discharge_efficiency = math.sqrt(
+            inverter_efficiency
+        )
+
+        battery_standing_loss = float(
+            battery_cfg.get(
+                "standing_loss",
+                0.0,
+            )
+        )
+
+        if not 0.0 <= battery_standing_loss < 1.0:
+            raise ValueError(
+                "battery.standing_loss must be in the interval [0, 1)."
+            )
+
+        battery_cyclic = bool(
+            battery_cfg.get(
+                "cyclic_state_of_charge",
+                True,
+            )
+        )
+
+        battery_inverter_annual_cost = (
+            get_annualized_capital_cost(
+                inverter_technology
+            )
+        )
+
+        battery_storage_annual_cost = (
+            get_annualized_capital_cost(
+                storage_technology
+            )
+        )
+
+        # Charging Link.
+        #
+        # The inverter's annualized power cost is assigned here once.
+        # The discharging Link below receives zero capital cost because
+        # both directions represent the same physical bidirectional inverter.
+        n.add(
+            "Link",
+            "battery_charger",
+            bus0="electricity_bus",
+            bus1="battery_bus",
+            carrier="battery",
+            p_nom_extendable=True,
+            p_min_pu=0.0,
+            efficiency=battery_charge_efficiency,
+            capital_cost=battery_inverter_annual_cost,
+            marginal_cost=0.0,
+        )
+
+        # Energy reservoir.
+        n.add(
+            "Store",
+            "battery_store",
+            bus="battery_bus",
+            carrier="battery",
+            e_nom_extendable=True,
+            e_cyclic=battery_cyclic,
+            standing_loss=battery_standing_loss,
+            capital_cost=battery_storage_annual_cost,
+            marginal_cost=0.0,
+        )
+
+        # Discharging direction of the same inverter.
+        #
+        # Its capacity will be coupled to battery_charger during
+        # optimization. Therefore no second inverter CAPEX is assigned.
+        n.add(
+            "Link",
+            "battery_discharger",
+            bus0="battery_bus",
+            bus1="electricity_bus",
+            carrier="battery",
+            p_nom_extendable=True,
+            p_min_pu=0.0,
+            efficiency=battery_discharge_efficiency,
+            capital_cost=0.0,
+            marginal_cost=0.0,
+        )
+
+
+
+
+    # -------------------------------------------------------------------------
+    # 12. Add flexible Bitcoin mining sink
+    # -------------------------------------------------------------------------
+    #
+    # Bitcoin mining is represented as a controllable electricity consumer.
+    #
+    # A PyPSA Generator with sign=-1 consumes electricity from the
+    # electricity bus. Its dispatch can vary freely between zero and the
+    # configured fixed mining capacity.
+    #
+    # The negative marginal cost represents the net operating value obtained
+    # from mining one additional MWh of electricity.
+    #
+    # For the current S2 architecture-validation case, mining capacity is
+    # deliberately fixed rather than optimized because mining CAPEX has not
+    # yet been introduced into the redesigned model.
+    # -------------------------------------------------------------------------
+
+    if bitcoin_enabled:
+        bitcoin_operating_mode = bitcoin_cfg.get(
+            "operating_mode",
+            "economic_dispatch",
+        )
+
+        if bitcoin_operating_mode != "economic_dispatch":
+            raise ValueError(
+                "The current Bitcoin implementation requires "
+                "bitcoin.operating_mode='economic_dispatch'."
+            )
+
+        # -------------------------------------------------------------
+        # Bitcoin mining capacity formulation
+        # -------------------------------------------------------------
+        #
+        # fixed:
+        #   Preserve the existing S2/S3 formulation exactly.
+        #
+        # endogenous:
+        #   Mining capacity becomes an investment decision variable.
+        #   A defensible mining-capacity cost must be supplied before
+        #   this mode can be solved.
+        #
+        bitcoin_capacity_mode = str(
+            bitcoin_cfg.get(
+                "capacity_mode",
+                "fixed",
+            )
+        ).strip().lower()
+
+        if bitcoin_capacity_mode not in {
+            "fixed",
+            "endogenous",
+        }:
+            raise ValueError(
+                "bitcoin.capacity_mode must be either "
+                "'fixed' or 'endogenous'."
+            )
+
+        bitcoin_capacity_mw = 0.0
+        bitcoin_capacity_annual_cost_eur_per_mw = 0.0
+
+        if bitcoin_capacity_mode == "fixed":
+            configured_capacity_mw = bitcoin_cfg.get(
+                "max_capacity_mw"
+            )
+
+            if configured_capacity_mw is None:
+                raise ValueError(
+                    "bitcoin.max_capacity_mw must be defined "
+                    "when bitcoin.capacity_mode='fixed'."
+                )
+
+            bitcoin_capacity_mw = float(
+                configured_capacity_mw
+            )
+
+            if bitcoin_capacity_mw <= 0.0:
+                raise ValueError(
+                    "bitcoin.max_capacity_mw must be greater "
+                    "than zero when bitcoin.capacity_mode='fixed'."
+                )
+
+        else:
+            configured_capacity_cost = bitcoin_cfg.get(
+                "annualized_capacity_cost_eur_per_mw_year"
+            )
+
+            if configured_capacity_cost is None:
+                raise ValueError(
+                    "bitcoin.annualized_capacity_cost_eur_per_mw_year "
+                    "must be defined when "
+                    "bitcoin.capacity_mode='endogenous'."
+                )
+
+            bitcoin_capacity_annual_cost_eur_per_mw = float(
+                configured_capacity_cost
+            )
+
+            if bitcoin_capacity_annual_cost_eur_per_mw <= 0.0:
+                raise ValueError(
+                    "bitcoin.annualized_capacity_cost_eur_per_mw_year "
+                    "must be greater than zero for endogenous "
+                    "Bitcoin capacity."
+                )
+
+        hashprice_eur_per_th_day = float(
+            bitcoin_cfg.get(
+                "hashprice_eur_per_th_day",
+                0.0,
+            )
+        )
+
+        asic_efficiency_j_per_th = float(
+            bitcoin_cfg.get(
+                "asic_efficiency_j_per_th",
+                0.0,
+            )
+        )
+
+        bitcoin_pue = float(
+            bitcoin_cfg.get(
+                "pue",
+                1.0,
+            )
+        )
+
+        bitcoin_other_opex_eur_per_mwh = float(
+            bitcoin_cfg.get(
+                "other_opex_eur_per_mwh",
+                0.0,
+            )
+        )
+
+        if hashprice_eur_per_th_day < 0.0:
+            raise ValueError(
+                "bitcoin.hashprice_eur_per_th_day "
+                "must be non-negative."
+            )
+
+        if asic_efficiency_j_per_th <= 0.0:
+            raise ValueError(
+                "bitcoin.asic_efficiency_j_per_th "
+                "must be greater than zero."
+            )
+
+        if bitcoin_pue < 1.0:
+            raise ValueError(
+                "bitcoin.pue must be greater than "
+                "or equal to 1.0."
+            )
+
+        if bitcoin_other_opex_eur_per_mwh < 0.0:
+            raise ValueError(
+                "bitcoin.other_opex_eur_per_mwh "
+                "must be non-negative."
+            )
+
+        # Facility-side electricity requirement.
+        #
+        # ASIC efficiency is defined at miner wall power.
+        # PUE accounts for additional facility auxiliaries.
+        mw_per_th_per_s = (
+            asic_efficiency_j_per_th
+            * bitcoin_pue
+            / 1e6
+        )
+
+        # Hashprice is quoted per TH/s per day.
+        #
+        # 1 MWh corresponds to operating 1 MW for one hour, i.e. 1/24 day.
+        th_day_per_mwh = (
+            (1.0 / 24.0)
+            / mw_per_th_per_s
+        )
+
+        bitcoin_gross_revenue_eur_per_mwh = (
+            hashprice_eur_per_th_day
+            * th_day_per_mwh
+        )
+
+        bitcoin_net_value_eur_per_mwh = (
+            bitcoin_gross_revenue_eur_per_mwh
+            - bitcoin_other_opex_eur_per_mwh
+        )
+
+        # Regression check for the previously validated conversion:
+        #
+        # 16 J/TH and 0.08 EUR/(TH/s)/day
+        # -> 2604.1667 TH-day/MWh
+        # -> 208.3333 EUR/MWh gross revenue.
+        if (
+            abs(
+                asic_efficiency_j_per_th
+                - 16.0
+            )
+            < 1e-9
+            and abs(
+                hashprice_eur_per_th_day
+                - 0.08
+            )
+            and abs(
+                bitcoin_other_opex_eur_per_mwh
+            )
+            < 1e-9
+            and abs(
+                bitcoin_pue
+                - 1.0
+            )
+            < 1e-9
+        ):
+            assert abs(
+                th_day_per_mwh
+                - 2604.166666666667
+            ) < 1e-9
+
+            assert abs(
+                bitcoin_gross_revenue_eur_per_mwh
+                - 208.33333333333334
+            ) < 1e-9
+
+        # -------------------------------------------------------------
+        # Add Bitcoin mining electricity sink
+        # -------------------------------------------------------------
+        #
+        # fixed:
+        #   Preserve the existing S2/S3 architecture exactly.
+        #
+        # endogenous:
+        #   Installed mining capacity becomes an optimization variable.
+        #   The annualized mining-capacity cost is included through
+        #   Generator.capital_cost.
+        #
+        if bitcoin_capacity_mode == "fixed":
+            n.add(
+                "Generator",
+                "bitcoin_mining_sink",
+                bus="electricity_bus",
+                carrier="bitcoin_mining",
+                sign=-1.0,
+                p_nom=bitcoin_capacity_mw,
+                p_nom_extendable=False,
+                p_min_pu=0.0,
+                p_max_pu=1.0,
+                capital_cost=0.0,
+                marginal_cost=-bitcoin_net_value_eur_per_mwh,
+            )
+
+        else:
+            n.add(
+                "Generator",
+                "bitcoin_mining_sink",
+                bus="electricity_bus",
+                carrier="bitcoin_mining",
+                sign=-1.0,
+                p_nom=0.0,
+                p_nom_extendable=True,
+                p_nom_min=0.0,
+                p_min_pu=0.0,
+                p_max_pu=1.0,
+                capital_cost=bitcoin_capacity_annual_cost_eur_per_mw,
+                marginal_cost=-bitcoin_net_value_eur_per_mwh,
+            )
+
+    # -------------------------------------------------------------------------
+    # 13. Add electrolyzer
+    # -------------------------------------------------------------------------
+    electrolyzer_efficiency = get_cost(
+        "electrolysis",
+        "efficiency",
+    )
+
+    configured_efficiency = hydrogen_cfg.get(
+        "electrolyzer_efficiency"
+    )
+
+    if configured_efficiency is not None:
+        electrolyzer_efficiency = float(
+            configured_efficiency
+        )
+
+    if not 0.0 < electrolyzer_efficiency <= 1.0:
+        raise ValueError(
+            "Electrolyzer efficiency must be "
+            "greater than 0 and at most 1."
+        )
+
+    electrolyzer_vom = float(
+        hydrogen_cfg.get(
+            "electrolyzer_variable_cost_eur_per_mwh",
+            get_cost(
+                "electrolysis",
+                "VOM",
+                0.0,
+            ),
+        )
+    )
+
+    n.add(
+        "Link",
+        "electrolyzer",
+        bus0="electricity_bus",
+        bus1="hydrogen_bus",
+        carrier="electrolyzer",
+        p_nom_extendable=True,
+        efficiency=electrolyzer_efficiency,
+        capital_cost=(
+            get_electrolyzer_annualized_capital_cost()
+        ),
+        marginal_cost=electrolyzer_vom,
+    )
+
+    # -------------------------------------------------------------------------
+    # 14. Add flexible hydrogen delivery
+    # -------------------------------------------------------------------------
+    #
+    # Hydrogen leaves the modeled plant through a flexible delivery sink.
+    #
+    # This is NOT an exogenous hourly hydrogen demand profile.
+    # The optimizer is free to choose WHEN hydrogen is produced and
+    # delivered. Only the annual delivered quantity is constrained.
+    #
+    # A Generator with sign=-1 behaves as a controllable consumer on the
+    # hydrogen bus. Its positive dispatch therefore represents hydrogen
+    # leaving the modeled system.
+    # -------------------------------------------------------------------------
+
+    hydrogen_lhv_kwh_per_kg = float(
+        hydrogen_cfg.get(
+            "hydrogen_lhv_kwh_per_kg",
+            33.33,
+        )
+    )
+
+    if hydrogen_lhv_kwh_per_kg <= 0.0:
+        raise ValueError(
+            "hydrogen.hydrogen_lhv_kwh_per_kg "
+            "must be greater than zero."
+        )
+
+    # Merchant hydrogen value is defined at the plant boundary in EUR/kg_H2
+    # and is used only in economic_dispatch mode.
+    #
+    # Conversion:
+    #
+    #   EUR/kg_H2 * 1000 kWh/MWh
+    #   -------------------------------- = EUR/MWh_H2
+    #          kWh_H2/kg_H2
+    #
+    # Zero is deliberately allowed so that a no-revenue merchant case can
+    # be used as a regression test.
+    hydrogen_sale_value_eur_per_kg_h2 = 0.0
+    hydrogen_sale_value_eur_per_mwh_h2 = 0.0
+
+    if hydrogen_mode == "economic_dispatch":
+        configured_hydrogen_sale_value = (
+            hydrogen_cfg.get(
+                "sale_value_eur_per_kg_h2"
+            )
+        )
+
+        if configured_hydrogen_sale_value is None:
+            raise ValueError(
+                "hydrogen.sale_value_eur_per_kg_h2 "
+                "must be defined for "
+                "hydrogen.mode='economic_dispatch'."
+            )
+
+        hydrogen_sale_value_eur_per_kg_h2 = float(
+            configured_hydrogen_sale_value
+        )
+
+        if (
+            not math.isfinite(
+                hydrogen_sale_value_eur_per_kg_h2
+            )
+            or hydrogen_sale_value_eur_per_kg_h2 < 0.0
+        ):
+            raise ValueError(
+                "hydrogen.sale_value_eur_per_kg_h2 "
+                "must be finite and non-negative."
+            )
+
+        hydrogen_sale_value_eur_per_mwh_h2 = (
+            hydrogen_sale_value_eur_per_kg_h2
+            * 1000.0
+            / hydrogen_lhv_kwh_per_kg
+        )
+
+    target_annual_kt_h2 = None
+    target_annual_h2_mwh = None
+
+    if hydrogen_mode == "production_target":
+        target_annual_kt_h2 = hydrogen_cfg.get(
+            "target_annual_kt_h2"
+        )
+
+        if target_annual_kt_h2 is None:
+            raise ValueError(
+                "hydrogen.target_annual_kt_h2 must be defined "
+                "for production_target mode."
+            )
+
+        target_annual_kt_h2 = float(
+            target_annual_kt_h2
+        )
+
+        if target_annual_kt_h2 <= 0.0:
+            raise ValueError(
+                "hydrogen.target_annual_kt_h2 "
+                "must be greater than zero."
+            )
+
+        # 1 kt = 1,000,000 kg.
+        #
+        # kg * kWh/kg / 1000 = MWh
+        target_annual_h2_mwh = (
+            target_annual_kt_h2
+            * 1_000_000.0
+            * hydrogen_lhv_kwh_per_kg
+            / 1000.0
+        )
+
+        # In production_target mode the delivery boundary remains identical
+        # to the frozen S0-S3/S2E/S3E implementation.
+        minimum_snapshot_weight = float(
+            n.snapshot_weightings.generators.min()
+        )
+
+        hydrogen_delivery_p_nom = (
+            target_annual_h2_mwh
+            / minimum_snapshot_weight
+        )
+
+        hydrogen_delivery_kwargs = {
+            "p_nom": hydrogen_delivery_p_nom,
+            "p_nom_extendable": False,
+        }
+
+    elif hydrogen_mode == "maximize_production":
+        # No annual hydrogen target exists in HMAX mode.
+        #
+        # The delivery sink must therefore not be sized from a prescribed
+        # annual quantity. Its capacity is made extendable with zero cost.
+        # run_model.py will subsequently couple the optimization to annual
+        # hydrogen production and perform the HMAX optimization.
+        hydrogen_delivery_kwargs = {
+            "p_nom": 0.0,
+            "p_nom_extendable": True,
+            "p_nom_min": 0.0,
+            "capital_cost": 0.0,
+        }
+
+    elif hydrogen_mode == "economic_dispatch":
+        # Merchant hydrogen production has no prescribed annual quantity.
+        #
+        # The delivery component represents only the plant-boundary product
+        # sink. It therefore has no independent investment cost; physical
+        # hydrogen-production capacity remains represented by the PEM link.
+        hydrogen_delivery_kwargs = {
+            "p_nom": 0.0,
+            "p_nom_extendable": True,
+            "p_nom_min": 0.0,
+            "capital_cost": 0.0,
+        }
+
+    else:
+        raise RuntimeError(
+            f"Unexpected hydrogen mode {hydrogen_mode!r}."
+        )
+
+    n.add(
+        "Generator",
+        "hydrogen_delivery",
+        bus="hydrogen_bus",
+        carrier="hydrogen_delivery",
+        sign=-1.0,
+        p_min_pu=0.0,
+        p_max_pu=1.0,
+        marginal_cost=(
+            -hydrogen_sale_value_eur_per_mwh_h2
+            if hydrogen_mode == "economic_dispatch"
+            else 0.0
+        ),
+        **hydrogen_delivery_kwargs,
+    )
+
+    # -------------------------------------------------------------------------
+    # 15. Diagnostics
+    # -------------------------------------------------------------------------
+    print("\n================================================")
+    print("OFF-GRID NETWORK BUILT")
+    print("================================================")
+
+    print(f"Scenario:        {cfg.get('scenario_name')}")
+    print(f"Model type:      {model_type}")
+    print(f"Investment year: {investment_year}")
+    print(f"Weather year:    {weather_year}")
+    print(f"Snapshots:       {len(n.snapshots)}")
+
+    print(f"First snapshot:  {n.snapshots[0]}")
+    print(f"Last snapshot:   {n.snapshots[-1]}")
+
+    print("\nTechnology switches:")
+    print(f"  Hydrogen:       {hydrogen_enabled}")
+    print(f"  Battery:        {battery_enabled}")
+    print(f"  Bitcoin:        {bitcoin_enabled}")
+    print(f"  H2 storage:     {hydrogen_storage_enabled}")
+
+    print("\nHydrogen:")
+    print(
+        f"  Mode:                   "
+        f"{hydrogen_mode}"
+    )
+    print(
+        f"  Electrolyzer efficiency:"
+        f" {electrolyzer_efficiency:.4f}"
+    )
+    print(
+        f"  H2 LHV:                 "
+        f"{hydrogen_lhv_kwh_per_kg:.2f} kWh/kg"
+    )
+
+    if hydrogen_mode == "production_target":
+        print(
+            f"  Annual target [kt]:     "
+            f"{target_annual_kt_h2}"
+        )
+        print(
+            f"  Annual target energy:   "
+            f"{target_annual_h2_mwh:.2f} MWh_H2"
+        )
+        print(
+            "  Annual target constraint: "
+            "added during optimization"
+        )
+
+    elif hydrogen_mode == "maximize_production":
+        print(
+            "  Annual target [kt]:     "
+            "none (endogenous)"
+        )
+        print(
+            "  Annual target constraint: "
+            "not used"
+        )
+
+    elif hydrogen_mode == "economic_dispatch":
+        print(
+            "  Annual target [kt]:     "
+            "none (merchant production)"
+        )
+        print(
+            "  Annual target constraint: "
+            "not used"
+        )
+        print(
+            f"  H2 sale value:          "
+            f"{hydrogen_sale_value_eur_per_kg_h2:.6f} "
+            "EUR/kg_H2"
+        )
+        print(
+            f"  H2 sale value:          "
+            f"{hydrogen_sale_value_eur_per_mwh_h2:.6f} "
+            "EUR/MWh_H2"
+        )
+
+    if battery_enabled:
+        print("\nBattery:")
+        print(
+            f"  Inverter technology: "
+            f"{inverter_technology}"
+        )
+        print(
+            f"  Storage technology: "
+            f"{storage_technology}"
+        )
+        print(
+            f"  Inverter efficiency: "
+            f"{inverter_efficiency:.4f}"
+        )
+        print(
+            f"  Charge efficiency: "
+            f"{battery_charge_efficiency:.6f}"
+        )
+        print(
+            f"  Discharge efficiency: "
+            f"{battery_discharge_efficiency:.6f}"
+        )
+        print(
+            f"  Round-trip efficiency: "
+            f"{battery_charge_efficiency * battery_discharge_efficiency:.4f}"
+        )
+        print(
+            f"  Inverter annual cost: "
+            f"{battery_inverter_annual_cost:.2f} EUR/MW/a"
+        )
+        print(
+            f"  Storage annual cost: "
+            f"{battery_storage_annual_cost:.2f} EUR/MWh/a"
+        )
+        print(
+            f"  Standing loss: "
+            f"{battery_standing_loss:.6f}"
+        )
+        print(
+            "  Power coupling constraint: "
+            "required during optimization"
+        )
+
+
+
+
+
+    if bitcoin_enabled:
+        print("\nBitcoin mining:")
+        print(
+            f"  Capacity mode: "
+            f"{bitcoin_capacity_mode}"
+        )
+
+        if bitcoin_capacity_mode == "fixed":
+            print(
+                f"  Fixed mining capacity: "
+                f"{bitcoin_capacity_mw:.3f} MW"
+            )
+        else:
+            print(
+                f"  Annualized capacity cost: "
+                f"{bitcoin_capacity_annual_cost_eur_per_mw:.2f} EUR/MW/a"
+            )
+        print(
+            f"  ASIC efficiency: "
+            f"{asic_efficiency_j_per_th:.3f} J/TH"
+        )
+        print(
+            f"  Hashprice: "
+            f"{hashprice_eur_per_th_day:.4f} "
+            f"EUR/(TH/s)/day"
+        )
+        print(
+            f"  TH-day per MWh: "
+            f"{th_day_per_mwh:.6f}"
+        )
+        print(
+            f"  Gross revenue: "
+            f"{bitcoin_gross_revenue_eur_per_mwh:.6f} EUR/MWh"
+        )
+        print(
+            f"  Variable mining OPEX: "
+            f"{bitcoin_other_opex_eur_per_mwh:.6f} EUR/MWh"
+        )
+        print(
+            f"  Net operating value: "
+            f"{bitcoin_net_value_eur_per_mwh:.6f} EUR/MWh"
+        )
+
+    print("\nComponents:")
+    print(
+        "  Buses:      ",
+        list(n.buses.index),
+    )
+    print(
+        "  Generators: ",
+        list(n.generators.index),
+    )
+    print(
+        "  Links:      ",
+        list(n.links.index),
+    )
+    print(
+        "  Loads:      ",
+        list(n.loads.index),
+    )
+    print(
+        "  Stores:     ",
+        list(n.stores.index),
+    )
+
+    print("================================================\n")
 
     return n

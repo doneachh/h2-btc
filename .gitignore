@@ -1,1 +1,31 @@
-google-chrome-stable_current_amd64.deb
+# Python
+__pycache__/
+*.py[cod]
+
+# Snakemake runtime files
+.snakemake/
+
+# Generated model results
+results/
+
+# Generated workflow markers
+data/*/processed_inputs.done
+
+# Logs
+*.log
+
+# Downloaded installers
+*.deb
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+
+# Generated S1 scenario inputs
+data/s1_battery/
+
+# Generated S2 scenario inputs
+data/s2_bitcoin/
+
+# Generated S3 scenario inputs
+data/s3_battery_bitcoin/
